@@ -1,0 +1,402 @@
+import {
+  DifferentialFanOut,
+  DifferentialVerdict,
+  IssueRouting,
+  NightlyLoop,
+  Reductions,
+  SignatureFlow,
+  TierCoverage,
+} from "@/components/article/diagrams/turf-fuzzer";
+
+At midnight India time, four CI jobs start trying to break the Turflang compiler. For about three hours each
+they feed it programs nobody would write: real programs with tokens swapped, deleted and duplicated, and
+generated programs whose exact output is known in advance. If the compiler crashes, hangs, leaks, accepts an
+unsafe program, or prints a different answer at a different optimisation level, there is a GitHub issue about it
+by morning, usually with a reproducer of about a dozen lines.
+
+The system is called [turf-fuzz](https://github.com/turf-lang/turf-fuzz). This article walks through it, from
+the program generator to the bot that files the issues. So far it has found more than thirty compiler bugs. Each
+fix in [the compiler](https://github.com/turf-lang/turf-lang) came with a test that fails if the bug comes back.
+
+## Why fuzz a compiler
+
+A compiler's test suite checks the programs its authors thought of, and users write the rest. The bugs tend to
+sit in combinations nobody would put in a test on purpose: a `give`/`otherwise` expression as the first element
+of an array literal, a struct of `bool`, `int` and `bool[4]` copied with `.copy()`, a top-level `;` followed by
+a malformed number. Each of those appears later in this article, and each one crashed or miscompiled a compiler
+that passed its own tests.
+
+Producing strange inputs is easy. Most of the work in turf-fuzz goes into three other problems: deciding what
+the right behaviour is for each input, recognising one bug when it shows up a thousand times, and cutting a
+300-line accident down to something a person can read.
+
+<Note>
+  turf-fuzz has its own repository because fuzzing runs for hours over large corpora, on its own CI budget,
+  and the compiler's CI should never wait for it. The compiler keeps a three-minute crash fuzz on every push.
+  The rest runs here, overnight.
+</Note>
+
+## Six ways to break a compiler
+
+turf-fuzz runs five tiers and one extra oracle, each covering a gap in the others. A crash fuzzer sees crashes,
+but it can't tell a wrong answer from a right one. A program generator knows the right answer, though it only
+writes programs it understands. An in-process fuzzer is fast and never reaches code generation. Between them
+they reach from the compiler's lexer to the garbage collector of the program it built.
+
+<Figure
+  caption="Which stages of the compiler each tier drives, and what it treats as a failure. Shaded bars are the stages a tier's oracle is aimed at; the pale track behind them is the rest of the pipeline the program still passes through."
+>
+  <TierCoverage />
+</Figure>
+
+### Tier 0: mutate real programs
+
+Tier 0 takes about 1,200 of the compiler's own programs, from its tests, showcase and examples, and mutates them
+a token or a line at a time. It deletes, duplicates and swaps, and splices in keywords read from the lexer's
+keyword table. Each mutant is compiled at a randomly chosen optimisation level. Exit 0 means it compiled and
+exit 1 means it reported an error, which is the right answer for a mangled program. Anything else is a bug: a
+sanitizer report, a failed assertion, `LLVM ERROR`, an internal compiler error, a signal, a hang, or another
+exit status.
+
+It runs at about 15 compiles a second, with `--emit-obj` so nothing waits on the system linker. Every night it
+runs against the ordinary compiler, and for three hours against one built with
+[AddressSanitizer](https://clang.llvm.org/docs/AddressSanitizer.html) and
+[UndefinedBehaviorSanitizer](https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html), so memory errors
+inside the compiler stop the run instead of passing silently.
+
+This tier found that `sizeof(void)` hung the compiler, and that reading through a setter-only `operator []` made
+LLVM abort.
+
+### Tier 1: a generator that knows the answer
+
+Mutation can't find a miscompile. A program that prints `534` when it should print `12` exits cleanly, and a
+crash fuzzer has no complaint. To catch it, the fuzzer has to know what the program should print.
+
+`gen/generate.py` writes random, valid Turflang programs from a seed. They use integers at their limits, every
+operator, `double`, `int32`, `char` and `string`, structs with methods, fixed and slice arrays, `List`, `Stack`,
+`Queue`, `Set` and `Map`, errors with payloads and `recover`, `defer`, enums and `compare`, generics, and graphs
+of heap references with null checks. Loop bounds are literals or array lengths and a static cost estimate caps
+the total work, so every program finishes. The same seed always gives the same program.
+
+`gen/evaluate.py` runs the generator's syntax tree directly, without the compiler, and predicts the exact
+output: every line of stdout, the exit status, and the message and line of any trap. It follows only the rules
+written down in `gen/SEMANTICS.md`, and each rule cites its source, either a page of the language documentation
+or a probe of the compiler. When the documentation and the compiler disagree, that disagreement is filed as a
+finding.
+
+Some of the rules in that file exist because the fuzzer raised the question. What is `INT_MIN % -1`? (It is `0`,
+and it used to be a `SIGFPE` at `-O0` and garbage above it.) What does `x >> 64` do? (It traps, like `<<`; it
+was LLVM poison and varied with the optimisation level.) In what order does `l[i] = e` evaluate its parts? (The
+value first, everywhere.) Each answer is now written into the language's documentation or its frozen
+specification, and pinned by a test.
+
+### Tier 2: the differential oracle
+
+The differential oracle builds one generated program in every configuration the toolchain has and runs each
+build.
+
+<Figure
+  caption="One seed, one program, twelve executions. The ASan builds link the runtime and collector compiled with AddressSanitizer; GC stress collects on every allocation, GC validate checks the heap's invariants as it goes."
+>
+  <DifferentialFanOut />
+</Figure>
+
+The language promises that optimisation never changes what a program does. All twelve runs must print the same
+thing and end the same way, and that has to match the evaluator's prediction. The verdict is a sequence of
+checks in a fixed order, so a memory error in the runtime is reported as a memory error even when it also made
+two runs disagree.
+
+<Figure caption="The differential oracle's verdict. The first check that answers yes names the finding's class.">
+  <DifferentialVerdict />
+</Figure>
+
+When all twelve runs agree with each other and disagree with the evaluator, the evaluator is the likelier
+culprit: it is a few hundred lines of Python modelling a whole language. A `wrong-answer` is treated as a
+generator bug until shown otherwise. `gen/trace.py` settles the question in one step. It rewrites the program to
+print every scalar after every statement, runs both sides, and reports the first statement after which they
+differ.
+
+The same tool located the worst bug in this article. Seed 100328 produced a program whose runs disagreed with
+each other and all died with `malloc(): corrupted top size`. The trace stopped at a `.copy()` of an array of
+structs. The compiler had given LLVM the target's data layout only after code generation. Every size it computed
+before that (array copies, `sizeof`, the buffers behind every `List<T>`) used LLVM's default layout, which
+aligns a 64-bit integer to four bytes. This struct came out 16 bytes instead of 24. The copy allocated 48 bytes
+and wrote 72.
+
+```turf
+import io;
+struct S0 { f0: bool, f1: int, f2: bool[4] }
+fn main(): int {
+    mut a1: S0[3] = [S0::default(), S0::default(), S0::default()];
+    a1[2].f1 = 7;
+    mut w1: S0[] = a1.copy();
+    mut w2: S0[] = a1.copy();
+    w2[1].f1 = 5;
+    io::printline(w1[2].f1 + w2[1].f1 + a1[1].f1);
+    return 0;
+}
+```
+
+This printed `534`. Since the fix it prints `12`, and a test in the compiler fails on the old version.
+
+### Tier 3: references that outlive their frame
+
+Turflang lets a function take the address of a local, `&n`, and checks at compile time that the reference never
+outlives the frame it points into: it cannot be returned, stored in a long-lived field or a collection, or
+handed to `heap()`. A differential is a poor test of the flow pass that proves this, because a dangling read
+often prints the right number by luck.
+
+The soundness oracle generates 2,662 small programs at that boundary, each with a pinned verdict. A program
+whose reference comes from the frame must be rejected with `E086` and the right wording. One whose reference
+comes from a safe source must compile and print exactly `42` at `-O0`, at `-O2` and under the ASan runtime with
+a collection on every allocation. Between the escape and the read, every program calls a function that
+overwrites the stack, so a reference that did dangle prints garbage instead of `42`.
+
+It found that the escape analysis lost track of where a reference came from at every loop and in every `give`
+expression. It then confirmed eight shapes the documentation had listed as known gaps, among them struct copies,
+Lists of structs, two hops through parameters, and `&a[i]`. Per-field tracking closed all of them. Five
+questions about where the boundary should lie went to the language's owner, and the answers are now frozen
+rules.
+
+### The overflow oracle: checks the compiler removed
+
+Every `int` addition, subtraction, multiplication, division and array index in Turflang is checked at run time,
+unless the compiler proves the check can't fail and removes it. A wrong proof produces no error. The sum wraps
+or the index reads past the array, and since every optimisation level does the same thing, the differential sees
+nothing.
+
+The overflow oracle writes small programs of a few `int` variables updated in every way the language allows,
+with values chosen near the limits ($2^{63}-1$, $3037000500$, the first integer whose square overflows, and
+their neighbours), and runs them against an interpreter with unbounded integers. Every build must match it
+exactly: the same output, the same trap, on the same line. It was written after an audit found a hole in check
+elision. The analysis trusted a variable unless it recognised the construct that changed it, so `x++` inside a
+call argument, a `defer`, or `&x` handed to a callee could each change a value it thought it knew. The compiler
+now tracks a variable only when every use of it is a read or one of four modelled writes. The oracle checks
+every night that this still holds.
+
+### Tier 4: libFuzzer, inside the front end
+
+The fastest tier never starts the compiler as a process. The compiler exposes its front end as a library,
+`turf::analyze()`, which is also what the language server calls on every keystroke. turf-fuzz links it into
+[libFuzzer](https://llvm.org/docs/LibFuzzer.html), compiled with ASan and UBSan, and lets coverage guide the
+search: inputs that reach new branches in the lexer, parser, resolver, type checker, lint or flow passes are
+kept and mutated further. A custom mutator works at the level of tokens and lines rather than bytes, and splices
+two inputs at token boundaries.
+
+Because it runs inside a long-lived host, this tier can catch the library killing its caller, which the other
+tiers would read as an ordinary exit. One of its first runs produced a one-line input:
+
+```turf
+0E
+```
+
+A lexer error in a file's very first token called `exit(1)`, because the facade read that token before it had
+armed its error recovery. In `turfc` that looks like a normal error exit, but in the language server it would
+have killed the editor's Turflang support mid-keystroke. A later night found the same mistake one step further
+on, a top-level `;` followed by `.0.5`. Both are fixed, with tests in the compiler's API test suite.
+
+Before anything this tier reports is trusted, a gate analyses every test file in two different orders and
+requires identical results. The gate found a bug of its own: unused-variable warnings came out in memory-address
+order, so they differed between runs of the language server.
+
+## One bug, one name
+
+A fuzzer that finds one crash finds it a thousand times, each time through a different input, so deduplicating
+by input files a thousand reports. turf-fuzz deduplicates by what the compiler did. It gives each failure a
+signature, a short description that comes out the same for every input that triggers the same bug and different
+for different bugs.
+
+`triage/signature.py` builds the signature from the compiler's output. It starts with the kind of failure, taken
+from the first rule that matches (sanitizer report, failed assertion, `LLVM ERROR`, internal compiler error,
+hang, signal, unexpected exit status). Then it adds what identifies the bug within that kind: the sanitizer's
+report type, the assertion's text, the normalised error message, or the stack.
+
+<Figure
+  caption="A crash's stack becomes a directory name. Frames in LLVM, the C++ library and the sanitizer runtimes are not the compiler's and are dropped; the top three of the rest are kept, without addresses or argument lists. The directory is the twelve-digit SHA-1 of the kind and the text. The frames are the ones recorded for findings/crash/lint-branch-compare-int-min-literal; the addresses are illustrative, and signature.py gives the same name whatever they are."
+>
+  <SignatureFlow />
+</Figure>
+
+Everything that varies between two runs of the same bug is stripped before hashing: colour codes, directory
+paths (only the file name survives), hexadecimal addresses, every bare number, runs of whitespace. A line such
+as
+
+```sh
+error: /home/runner/work/x/prog.tr:12:5: overflow at 0x7ffd1234 after 37 steps
+```
+
+normalises to
+
+```sh
+error: prog.tr:N:N: overflow at ADDR after N steps
+```
+
+so two crashes at different addresses in different temporary directories get the same directory name. That
+directory is the whole deduplication mechanism. If `findings/<class>/<signature>/` exists, a new hit only
+increments a counter.
+
+Two rules came from mistakes the fuzzer made. A stack overflow from deep recursion crashes at a different point
+of the cycle on every input, so taking the top three frames would split one bug into many. When any function
+appears four or more times among the frames, the signature uses the sorted set of repeating functions instead.
+The second rule exists because the compiler's diagnostics quote the offending source line. A mutant with the
+text `Internal compiler error` in a comment was once filed as an internal compiler error, when the compiler had
+only reported a syntax error ([turf-fuzz#6](https://github.com/turf-lang/turf-fuzz/issues/6)). Quoted source
+lines are now stripped before any rule reads the output.
+
+## Down to the shortest program
+
+A generated program that triggers a bug is typically 150 to 300 lines long, and almost all of those lines are
+irrelevant. Findings are reduced before a person sees them, under a strict rule: a smaller program counts only
+if it fails with the same signature. A reduction that trades the original crash for a different one has found a
+different bug, so it is rejected.
+
+Text inputs, from tier 0 and libFuzzer, go through `triage/minimize.py`, a form of [delta
+debugging](https://doi.org/10.1109/32.988498) over lines. It splits the program into $n$ chunks and tries
+deleting each; when a deletion keeps the signature, it keeps the smaller program and coarsens again; when none
+does, it doubles $n$, down to single lines. Each probe is a full compile and a hang costs a whole timeout, so by
+default the search stops at 400 probes or three minutes, whichever comes first. The finding still has to be
+reported before the night's run ends.
+
+Generated programs are reduced with `gen/reduce.py`, which edits the generator's syntax tree. Every candidate is
+therefore well-formed Turflang, and the evaluator recomputes the expected output for each one. It deletes
+statements (half a body, then one at a time), replaces an `if` or a loop by the body it ran, drops branches and
+arms, replaces an expression by the value it had when the program ran, and deletes unused helpers, methods,
+structs, enums, fields and parameters. Each probe compiles only the configurations the verdict depends on, and
+probes run in parallel batches, taking the first success in a fixed order so that a reduction is deterministic
+for a given compiler.
+
+<Figure
+  caption="Lines in a finding's input against lines in the reproducer committed for it. Reduction is automatic; a few reproducers were finished by hand for the last lines."
+>
+  <Reductions />
+</Figure>
+
+One crash from the nightly run of 17 October started as 309 generated lines with enums, a generic struct with
+methods, and nested loops. The reducer spent 371 probes and 65 seconds and left this:
+
+```turf
+// turf-fuzz gen: seed=2026290000931 (reduced: 309 -> 12 lines, 371 probes, 65s, verdict kept on O0) paren=min
+import io;
+
+fn f2(): int {
+    if (false give 67 == -9223372036854775808 otherwise 41 < -5) {
+    }
+    return 0;
+}
+
+fn main(): int {
+    return 0;
+}
+```
+
+Together with the stack in the signature figure, that is enough to find the cause. The lint pass that looks for
+an `if` with two identical branches compared the arms' integer literals with LLVM's `APInt ==`, and
+`-9223372036854775808` is stored at a wider bit width than `41`. LLVM asserts when asked to compare integers of
+different widths, and without assertions it segfaults. The fix compares the values with `APSInt::isSameValue`.
+
+## The night shift
+
+The nightly run is a GitHub Actions workflow, `.github/workflows/nightly.yml`, scheduled for 18:30 UTC (midnight
+in India). Its logic lives in shell scripts under `ci/`, which run the same way on a laptop.
+
+<Figure
+  caption="One night. Four jobs run side by side for about three hours of fuzzing each; what they find is deduplicated, filed, fixed in the compiler and committed, and from then on the next night treats it as known."
+>
+  <NightlyLoop />
+</Figure>
+
+Two of the four jobs run the differential oracle with reduction, the soundness and overflow oracles, and the
+tier 0 fuzzer. One of them tests the compiler commit pinned in `compiler.lock` and the other tests the latest
+`master`. The third job runs tier 0 for three hours against the sanitized compiler. The fourth runs libFuzzer,
+starting from the corpus the previous night left behind (kept as a build artifact for thirty days), so coverage
+builds up from night to night.
+
+The pinned compiler makes findings reproducible, because every finding records the commit it was found on and
+replays against it exactly. The master compiler catches regressions introduced since the lock. Generator seeds
+come from the UTC date, the year times $10^9$ plus the day of the year times $10^6$, so seed `2026288000245` is
+the program at offset 245 of the run that started on 15 October. Any night can be replayed, and no two nights
+test the same programs.
+
+## How the bot files issues
+
+At the end of each job, `ci/file-issues.sh` turns the night's new signatures into GitHub issues, posting as the
+organisation's GitHub App, `turf-lang-bot`. Most of the script exists to make sure one bug never becomes a
+hundred issues.
+
+<Figure caption="What the bot does with each signature a job reports. Only one route opens a new issue.">
+  <IssueRouting />
+</Figure>
+
+An issue is titled `Nightly fuzz: <signature>`, with no job name in it, so the pinned and master jobs that hit
+the same bug share one issue. While the issue is open, each further sighting becomes a comment (`Seen again
+2026-10-17 by process/pinned`, with the run and the compiler commit), which turns the issue into a log of when
+and where the bug appears. A job opens at most ten issues a night; a bad regression that produces fifty new
+signatures gets ten issues and one more that lists the other forty.
+
+The body carries what triage needs: the run, the artifact holding the full reports, the compiler commit, the
+finding's report and metadata, and the reduced reproducer inline as a Turflang code block. Every issue gets
+three labels, created the first time they are needed so the repository needs no setup:
+
+| Label | Values | Says |
+| --- | --- | --- |
+| `fuzz-finding` | | found by the nightly run |
+| `kind:` | the finding's class: `ice`, `crash`, `signal`, `llvm-error`, `miscompile`, `wrong-answer`, `unsound`, `rejected-valid`, and so on | what went wrong |
+| `compiler:` | `pinned`, `master`, `sanitized` | which compiler showed it |
+
+The compiler label also dates the bug. A signature seen only by `compiler:master` is a fresh regression from a
+commit after the lock, and one that also has `compiler:pinned` is older than the lock. libFuzzer's inputs have
+no signature (the same bug returns under a new hash), so the engine job files one issue per kind of failure
+instead (crashes, timeouts, out of memory) under the same comment-if-open rule.
+
+## From a finding to a fix
+
+The bot opens issues and a person closes them, following the same steps each time.
+
+1. Reproduce the finding against the pinned compiler, from the seed or the reproducer in the issue.
+2. Decide whose bug it is. A wrong answer, or the first finding from a new generator feature, is presumed to be
+   the generator's until `gen/trace.py` shows otherwise. A generator bug is fixed in the generator and is not
+   recorded as a finding.
+3. Send language questions to the owner. When the specification is silent, the finding waits on the issue,
+   and the decision goes into the language's frozen rules and into `gen/SEMANTICS.md`, with its source.
+4. Fix the compiler and add a test in the same change: a `fail_*` test that expects the exact diagnostic, or a
+   run test with its expected output. The commit names the finding.
+5. Record it in turf-fuzz. The finding's directory, holding the reproducer and a report of the cause, the
+   decision and the fixing commit, is committed under `findings/`, and `compiler.lock` moves past the fix.
+
+[The issue for the crash above](https://github.com/turf-lang/turf-fuzz/issues/5) went through all of this. The
+bot opened it from the pinned job with an eight-line reproducer from a different seed, then added five "Seen
+again" comments over the next three days from both the pinned and master jobs. The cause was the lint pass's
+literal comparison, which the compiler had already fixed. The owner traced it there, bumped `compiler.lock` past
+the fix, committed the finding's directory, and closed the issue.
+
+<Note kind="help">
+  A minimized reproducer is never deleted, even after the fix. The committed directory is how every later
+  night recognises the bug as known.
+</Note>
+
+## What it has found
+
+More than thirty bugs so far, each fixed in the compiler with a test. A sample:
+
+| Bug | Found by |
+| --- | --- |
+| `INT_MIN % -1` raised `SIGFPE` at `-O0` and gave garbage above it | generator |
+| A struct's size was computed with the wrong data layout, so `.copy()` overflowed the heap | GC differential |
+| `char` comparisons treated bytes as signed: `(200 to char) > 'a'` was false | generator |
+| NaN printed as `nan` or `-nan` depending on the optimisation level | probing |
+| `x >> 64` was LLVM poison, so its value depended on `-O` | generator probe |
+| A lexer error in the first token called `exit()`, which would kill the language server | libFuzzer |
+| Every diagnostic leaked its temporaries under the library facade | libFuzzer |
+| Escape analysis lost a reference's provenance at loops and in `give` | soundness oracle |
+| `x.a.a.a...` on a non-struct took exponential compile time, then crashed | first CI dry run |
+| `sizeof(void)` hung the compiler | tier 0 |
+
+## What it cannot see yet
+
+The generator can only find bugs in features it knows how to write, and it doesn't cover the whole language yet.
+Generics with several type parameters, `StringBuilder`, string splitting and padding, function values, and
+several features from the 2.0 release are still on its list. Throughput is the other limit. The full generator
+manages about one program a second across eight workers, and libFuzzer about seven executions a second per
+worker, held back by seeds that are whole programs. Both are open work in the repository. Because the nightly
+run uses the generator straight from the repository, each new feature is fuzzed from the first night after it
+lands.
