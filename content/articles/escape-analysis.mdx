@@ -10,9 +10,9 @@ fn make(): &N {
 }
 ```
 
-`n` lives in `make()`'s stack frame, and the frame is gone the moment `make()` returns. The caller gets a
-reference to memory the next function call will reuse. It might read `42`, or `0`, or whatever the next call
-left there. Today the compiler stops it:
+`n` lives in `make()`'s stack frame, and that frame is gone once `make()` returns. The caller ends up with a
+reference to memory that the next function call will reuse, so it might read `42`, or `0`, or whatever that call
+left behind. The compiler now rejects it:
 
 ```text
 ── error at line 4, col 5 [E086 · dangling reference escape]
@@ -24,27 +24,26 @@ left there. Today the compiler stops it:
   function, or return or store a reference you received as a parameter instead of a local's.
 ```
 
-The check is a compiler pass called `EscapePass`. This article covers what it tracks and why it has no lifetime
-syntax. It also covers the sixteen shapes a fuzzer found that the pass got wrong, and what the pass looks like
-now that they are closed.
+The check is a compiler pass called `EscapePass`. This article covers what it tracks, why Turflang does it
+without lifetime annotations, and sixteen cases a fuzzer found that the pass got wrong.
 
 ## The rule
 
-Turflang has two safe reference types: `&T`, which is never null, and `&?T`, which must be checked before use.
-Neither says anything about where the target lives. A reference can point into the GC heap, into the caller's
-memory, or into the current function's own frame. Only the last can dangle, and only if the reference outlives
-the call.
+Turflang has two safe reference types: `&T`, which is never null, and `&?T`, which you have to check before
+using. Neither type says where the target lives. A reference can point into the GC heap, into the caller's
+memory, or into the current function's own frame. Only the last one can dangle, and only if the reference
+outlives the call.
 
-The language's rule, F-MEM-5 in its [frozen
-specification](https://github.com/turf-lang/turf-lang/blob/master/docs/development/FREEZE.md) (§6.13), names the
-places a reference must never reach if it points into the current frame. These sinks are the ways a value can
-outlive the function that made it:
+The [language specification](https://github.com/turf-lang/turf-lang/blob/master/docs/development/FREEZE.md)
+lists the places a reference into the current frame must never reach. We call these sinks. Each one is a way for
+a value to outlive the function that made it:
 
-<Figure caption="The six sinks. A reference with Stack provenance reaching any of them is E086. The usual fix is heap(), which copies the value to the GC heap and returns a reference that lives as long as anyone holds it.">
+<Figure caption="The six sinks. A reference into the current frame that reaches any of them is E086. The usual fix is heap(), which copies the value to the GC heap and returns a reference that lives as long as anyone holds it.">
   <EscapeSinks />
 </Figure>
 
-To enforce that, the pass gives every reference a provenance at every point in the function:
+To enforce this, the pass tracks where every reference came from at every point in the function. We call that
+its provenance:
 
 | Provenance | Means | At a sink |
 | --- | --- | --- |
@@ -54,70 +53,70 @@ To enforce that, the pass gives every reference a provenance at every point in t
 | `Heap` | from `heap()`, or read through something that is | allowed |
 | `Unknown` | the pass cannot tell | allowed |
 
-When the pass cannot classify a value, it lets it through. That was decided in the first version, and most of
-what follows depends on it.
+When the pass can't classify a value, it lets it through. We made that choice in the first version, and most of
+the rest of this article follows from it.
 
 ## Why there is no borrow checker
 
-Rust answers this question with lifetimes: every reference carries a region in its type, and the compiler proves
-at every use that the region is still alive. That works, and it costs syntax and a learning curve. Turflang's
-design rules out both. There are no lifetime annotations, no borrow checker, and no interprocedural summaries
-beyond one small exception covered below.
+Rust handles this with lifetimes. Every reference carries a region in its type, and the compiler checks at every
+use that the region is still alive. It works, but it adds syntax and takes time to learn. We wanted Turflang to
+have neither, so there are no lifetime annotations, no borrow checker, and almost no reasoning across function
+boundaries (one small exception comes up below).
 
-What Turflang gives up for that is completeness. The pass looks at one function at a time, follows a fixed set
-of expression shapes, and treats anything else as `Unknown`. It makes one promise in return: it never reports an
-error on a correct program. Every E086 is a real escape. The cost is that some real escapes, in shapes the pass
-does not model, get through, and the [design
+The trade-off is that the pass can't catch everything. It looks at one function at a time, understands a fixed
+set of expression shapes, and treats anything else as `Unknown`. In return it promises never to report an error
+on a correct program: every E086 is a real escape. Some real escapes, in shapes the pass doesn't model, still get
+through, and the [design
 record](https://github.com/turf-lang/turf-lang/blob/master/docs/development/changes/FDN-002.md) lists them.
 
-That promise was tested on the first day. Running the new pass over the compiler's test suite turned up two
-errors on correct programs. One was a `&pt1 to Point*` cast pushed into a `List<Point*>` that never left its
-function. The other was `&l.data[1]` on a `List`'s own heap-allocated buffer. Both were fixed by making the pass
-track less. A cast into raw pointers now leaves tracking entirely (unsafe code has opted out of the safety net),
-and `&expr[i]` is `Stack` only when the type says `expr` is a local fixed-size array.
+That promise was tested on day one. Running the new pass over the compiler's own test suite flagged two correct
+programs. One cast `&pt1` to `Point*` and pushed it into a `List<Point*>` that never left the function. The other
+took `&l.data[1]` on a `List`'s heap-allocated buffer. We fixed both by having the pass track less. A cast to a
+raw pointer now drops out of tracking entirely, since that's unsafe code, and `&expr[i]` counts as `Stack` only
+when the type says `expr` is a local fixed-size array.
 
 ## How the pass works
 
 `EscapePass` ([documented
 here](https://github.com/turf-lang/turf-lang/blob/master/docs/architecture/pointers_and_references.md)) is a
-forward dataflow analysis over the function's control-flow graph, run beside the pass that checks null
-dereferences. Its state at each point is a map from a *place* to a provenance. A place is a variable, or a path
-inside a value variable: `h.head`, `a[0].next`. A place missing from the map reads as its default, which for a
-reference parameter is `Param` and for anything else `Unknown`.
+forward dataflow analysis over the function's control-flow graph, and it runs alongside the pass that checks for
+null dereferences. At each point it keeps a map from a *place* to a provenance. A place is a variable, or a path
+inside a value variable such as `h.head` or `a[0].next`. A place that isn't in the map gets a default: `Param`
+for a reference parameter, `Unknown` for anything else.
 
-Each statement updates the map. `p = &n` sets `p` to `Stack`; `p = heap(n)` sets it to `Heap`; `h.head = p`
-copies `p`'s provenance to `h.head` and drops whatever was known under the old value. When a statement passes a
-value to a sink, the pass checks the value's provenance, and for a struct or array value it checks every place
-stored inside it too.
+Each statement updates the map. `p = &n` sets `p` to `Stack`, `p = heap(n)` sets it to `Heap`, and `h.head = p`
+copies `p`'s provenance to `h.head` and forgets whatever was known under the old value. When a statement hands a
+value to a sink, the pass checks that value's provenance, and for a struct or array it checks every place stored
+inside it too.
 
-Where control flow joins, after an `if` or at a loop header, the maps from each incoming path are merged, place
-by place:
+Where control flow joins, such as after an `if` or at the top of a loop, the maps from each incoming path are
+merged place by place:
 
-<Figure caption="Merging two paths' provenance for one place. Equal stays equal. Stack on either side makes MayStack, which is flagged at a sink like Stack. Any other disagreement becomes Unknown, which is never flagged.">
+<Figure caption="Merging two paths' provenance for one place. If they agree, the result is the same. Stack on either side gives MayStack, which is flagged at a sink just like Stack. Any other disagreement gives Unknown, which is never flagged.">
   <MergeGrid />
 </Figure>
 
-The pass repeats this until no map changes, a fixed point, and only then reports errors.
+The pass repeats this until the maps stop changing, and only then reports errors.
 
-Two details matter as the language grows. The statement visitor is a tree walker that recurses into any node
-kind it does not handle explicitly, so a new kind of expression is still searched for nested escapes. And the
-list of collection mutators (`push`, `set`, `put`, `add`, `enqueue` on `List`, `Map`, `Set`, `Stack` and
-`Queue`) is written out by hand, with a comment saying so. A sixth collection added later is not checked until
-someone adds it to that list.
+Two details matter as the language grows. The statement visitor walks into any kind of node it doesn't handle
+explicitly, so a new kind of expression is still searched for escapes nested inside it. The list of collection
+methods that store values (`push`, `set`, `put`, `add`, `enqueue` on `List`, `Map`, `Set`, `Stack` and `Queue`)
+is written out by hand, though, with a comment saying so. If we add a sixth collection type, it isn't checked
+until someone adds it to that list.
 
-## Sixteen shapes the pass got wrong
+## Sixteen cases the pass got wrong
 
-The pass landed in late September with six tests. In October, probing this boundary to build the
-[turf-fuzz](/research/turf-fuzzer) soundness oracle turned up sixteen shapes it got wrong. Fifteen were escapes
-it accepted: each compiled and returned a reference into a dead frame, and when the program ran, the read
-printed garbage at `-O0` once the next call reused the frame, and often a plausible `0` at `-O2`. The sixteenth
-was the opposite, a correct program it rejected. All sixteen are written up in turf-fuzz's [findings
+The pass landed in late September with six tests. In October, while building the escape checks for
+[turf-fuzz](/research/turf-fuzzer), we found sixteen cases it got wrong. In fifteen of them it accepted a real
+escape: the program compiled and returned a reference into a dead frame. At `-O0` the read printed garbage once
+the next call reused the frame, and at `-O2` it often printed a believable `0`. In the sixteenth it rejected a
+correct program. All sixteen are written up in turf-fuzz's [findings
 report](https://github.com/turf-lang/turf-fuzz/blob/master/findings/unsound/escape-boundary/report.md), and all
-were fixed in mid-October.
+were fixed by mid-October.
 
-### The loop that erased everything
+### Any loop turned the check off
 
-The first was the worst. Any loop between taking `&n` and returning it disabled the check:
+The first one was the most serious. Any loop between taking `&n` and returning it disabled the check:
 
 ```turf
 fn make(k: int): &N {
@@ -131,26 +130,26 @@ fn make(k: int): &N {
 }
 ```
 
-The merge at a loop header combines the path from before the loop with the loop's back edge. On the first
-iteration of the fixed-point loop, the back edge has not been computed yet. The pass treated it as an empty map,
-the merge of `{p: Stack}` with `{}` was empty, and `p` became `Unknown`. Unknown is never flagged, so the
-emptiness went round the loop for good.
+At the top of a loop, the pass merges the path coming from before the loop with the path coming back from the
+end of the loop body. On the first round, that second path hasn't been computed yet. The pass treated it as an
+empty map, so merging `{p: Stack}` with `{}` gave an empty map and `p` became `Unknown`. `Unknown` is never
+flagged, and the empty map carried on around the loop from there.
 
-<Figure caption="The same control-flow graph, before and after turflang 9398f38. Treating an uncomputed predecessor as empty erased every provenance at every loop; skipping it until it has been computed keeps them.">
+<Figure caption="The same control-flow graph before and after turflang 9398f38. Treating a path that hasn't been computed yet as empty wiped out every provenance at every loop. Skipping it until it has been computed keeps them.">
   <LoopBug />
 </Figure>
 
-[The fix](https://github.com/turf-lang/turf-lang/commit/9398f38) was one rule: skip a predecessor that has not
-been reached yet. In lattice terms, an uncomputed block is the top element, which leaves the merge unchanged.
-The pass that checks null dereferences had the same mistake, and it was fixed the same day.
+[The fix](https://github.com/turf-lang/turf-lang/commit/9398f38) was to skip an incoming path that hasn't been
+computed yet, so it leaves the merge unchanged. The null-dereference pass had the same mistake, and we fixed it
+the same day.
 
-Alongside it, a `give`/`otherwise` expression turned out to always be `Unknown`, so `return (c give &n otherwise
-&n2)` compiled. Now a `give` merges its two branches like two paths.
+Around the same time we found that a `give`/`otherwise` expression was always `Unknown`, so `return (c give &n
+otherwise &n2)` compiled. A `give` now merges its two branches the same way two paths are merged.
 
-### References inside values
+### References stored inside other values
 
-The next eight were shapes the original design record had listed as accepted gaps. The pass tracked variables,
-so a reference that escaped inside something else went unseen:
+The next eight were cases the original design record had already listed as known gaps. The pass tracked
+variables, so it missed a reference that escaped inside something else:
 
 ```turf
 fn make(): H {
@@ -161,23 +160,24 @@ fn make(): H {
 }
 ```
 
-The others were the same idea in other forms: `heap(m)` where `m.next` holds `&n`, a struct holding `&n` pushed
-into a `List`, `&a[i]` of a local array, `h.own.next = &n` two hops through a parameter, and a by-value
-parameter's field. Closing them meant reopening a decision. Per-field tracking had been listed as a non-goal,
-and the owner reopened it on condition that the pass still never reports a correct program.
+The others were variations on the same idea: `heap(m)` where `m.next` holds `&n`, a struct holding `&n` pushed
+into a `List`, `&a[i]` of a local array, `h.own.next = &n` two steps through a parameter, and a field of a
+parameter passed by value. Fixing them meant tracking individual fields, which the first design had ruled out. We
+decided to do it, as long as the pass still never flags a correct program.
 
-This is where places came from ([8e16021](https://github.com/turf-lang/turf-lang/commit/8e16021)). The map is
-keyed by paths inside values, a store into a path clears what was known under it, and every sink looks inside
-the value it receives. One fact crosses a function boundary: a function whose every `return` is one of its
-reference parameters, unchanged, passes that argument's provenance through to its caller. So `return id(&n)` is
-an error, and `return id(heap(n))` is not.
+That's where places came from ([8e16021](https://github.com/turf-lang/turf-lang/commit/8e16021)). The map is
+keyed by paths inside values, storing to a path clears what was known below it, and every sink looks inside the
+value it receives. One fact now crosses a function boundary: if every `return` in a function returns one of its
+reference parameters unchanged, the caller's argument keeps its provenance through the call. So `return id(&n)`
+is an error, and `return id(heap(n))` is not.
 
-### Five questions for the language's owner
+### Cases the rule didn't cover
 
-The last six shapes were not plain bugs. The rule did not say what should happen, so they went to the language's
-owner as five questions, and each answer became part of the rule.
+The last six weren't plain bugs. The rule didn't say what should happen, so we had to decide, and each decision
+went into the specification.
 
-The first was about a path that carries `&n` meeting one that does not. The pass had merged them to `Unknown`:
+The first question was what happens when a path that carries `&n` meets a path that doesn't. The pass had merged
+them to `Unknown`:
 
 ```turf
 fn make(c: bool): &N {
@@ -190,22 +190,22 @@ fn make(c: bool): &N {
 }
 ```
 
-The decision was that if any path carries `&n`, the escape is real on that path, so the merged value is
-`MayStack` and flagged ([1d210f3](https://github.com/turf-lang/turf-lang/commit/1d210f3)). That is the top row
-and left column of the merge table. It was the one decision that could have broken the never-a-false-positive
-promise. It keeps it, because the program above dangles whenever `c` is true.
+We decided that if any path carries `&n`, the escape is real on that path, so the merged value is `MayStack` and
+gets flagged ([1d210f3](https://github.com/turf-lang/turf-lang/commit/1d210f3)). That's the top row and left
+column of the merge table. It was the one decision that could have broken the promise of no false errors, and it
+doesn't, because the program above really does dangle whenever `c` is true.
 
-An error payload, `return E1::P(&n);`, is now a sink
+An error payload, as in `return E1::P(&n);`, is now a sink
 ([9afd843](https://github.com/turf-lang/turf-lang/commit/9afd843)), because the payload is copied to the heap so
 the error can be returned. A call's result counts as long-lived when none of its arguments can reach this frame,
-since a function cannot return its own locals, so `mut h: &N = mk(); h.next = &n;` is an error
-([d5c7825](https://github.com/turf-lang/turf-lang/commit/d5c7825)). The same applies to an element of a standard
+since a function can't return its own locals. So `mut h: &N = mk(); h.next = &n;` is an error
+([d5c7825](https://github.com/turf-lang/turf-lang/commit/d5c7825)). The same goes for an element of a standard
 collection.
 
-The last answer is about `defer`, and it fixed the one correct program the pass rejected. A deferred statement
-runs when its block exits, after a `return` has already computed its value. The pass had analysed it where it
-was written, so `a()` below was an error. Now it runs it at every exit of its block, last in first out
-([b7741c0](https://github.com/turf-lang/turf-lang/commit/b7741c0)):
+The last decision was about `defer`, and it fixed the one correct program the pass had rejected. A deferred
+statement runs when its block exits, after a `return` has already worked out its value. The pass had analysed it
+where it was written, so `a()` below was an error. Now the pass runs deferred statements at every exit of their
+block, last in, first out ([b7741c0](https://github.com/turf-lang/turf-lang/commit/b7741c0)):
 
 ```turf
 fn a(): &N {
@@ -224,33 +224,33 @@ fn b(): &N {
 ```
 
 Each of the sixteen is now a test in the compiler's
-[`tests/39_nullable_references/`](https://github.com/turf-lang/turf-lang/tree/master/tests/39_nullable_references),
-a `fail_escape_*` file that expects E086 with the right wording, next to `escape_*_ok` files for the shapes that
+[`tests/39_nullable_references/`](https://github.com/turf-lang/turf-lang/tree/master/tests/39_nullable_references):
+a `fail_escape_*` file that expects E086 with the right wording, next to `escape_*_ok` files for the cases that
 must keep compiling.
 
-## How it stays fixed
+## Keeping it fixed
 
-The [soundness oracle](https://github.com/turf-lang/turf-fuzz/blob/master/oracles/soundness.py) runs every
-night. It builds each program from three parts: a source of the reference, a sink it flows to, and the control
-flow wrapped around the sink.
+turf-fuzz's [soundness oracle](https://github.com/turf-lang/turf-fuzz/blob/master/oracles/soundness.py) runs
+every night. It builds each test program from three parts: where the reference comes from, which sink it reaches,
+and the control flow around the sink.
 
-<Figure caption="The soundness oracle. Each combination that type-checks becomes a small program with a verdict known in advance; five decided owner questions run alongside as pinned shapes.">
+<Figure caption="The soundness oracle. Every combination that type-checks becomes a small program whose correct result is known in advance. The five cases we had to decide run alongside as fixed tests.">
   <OracleProduct />
 </Figure>
 
-A program whose reference comes from the frame must fail with E086, and with the wording for its sink: a
-rejection for the wrong reason counts as a failure too. A program whose reference is safe must compile and print
-exactly `42` at `-O0`, at `-O2`, and under the AddressSanitizer runtime with a collection on every allocation.
-Between the escape and the read, each program calls a function that overwrites the stack, so a reference that
-does dangle prints garbage rather than a lucky `42`.
+If the reference comes from the frame, the program has to fail with E086 and with the wording for its sink.
+Rejecting it for the wrong reason counts as a failure too. If the reference is safe, the program has to compile
+and print exactly `42` at `-O0`, at `-O2`, and under AddressSanitizer with a garbage collection on every
+allocation. Between the escape and the read, each program calls a function that overwrites the stack, so a
+reference that does dangle prints garbage instead of a lucky `42`.
 
-## What it still lets through
+## What still gets through
 
-The pass does not look into an array element written at a run-time index, so `a[i] = &n; return a;` is
-`Unknown`. It does not follow a call result whose arguments might reach the frame. It stops at every cast into
-raw pointers, which only `unsafe` code can write. And a new collection type is unchecked until its mutators are
-added to the list.
+The pass doesn't track an array element written at an index known only at run time, so `a[i] = &n; return a;` is
+`Unknown`. It doesn't follow a call result whose arguments might reach the frame. It stops at every cast to a raw
+pointer, which only `unsafe` code can write. And a new collection type isn't checked until its methods are added
+to the list.
 
-Each of those would need either more of the program than one function, or a guess the pass is not allowed to
-make. Within the shapes it does cover, the soundness oracle reruns all 2,662 programs every night, so a
-regression shows up the morning after it lands.
+Catching any of these would mean looking beyond one function, or guessing, which the pass isn't allowed to do.
+For the cases it does cover, the soundness oracle reruns all 2,662 programs every night, so a regression shows up
+the morning after it lands.

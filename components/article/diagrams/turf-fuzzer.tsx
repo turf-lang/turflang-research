@@ -330,7 +330,7 @@ export function NightlyLoop() {
   const id = "dg-night";
   return (
     <Diagram
-      label="The nightly loop. At 00:00 IST, nightly.yml starts four jobs side by side: process against the pinned compiler, process against turflang master, the sanitized crash fuzz, and the libFuzzer engine. Their failures are reduced to signatures and deduplicated against findings/. The organisation's bot files an issue or comments on an open one. The owner triages it, the bug is fixed in turflang with a pinned test in the same change, the finding's directory is committed and compiler.lock is bumped, and the next night treats it as known."
+      label="The nightly loop. At 00:00 IST, nightly.yml starts four jobs side by side: process against the pinned compiler, process against turflang master, the sanitized crash fuzz, and the libFuzzer engine. Their failures are reduced to signatures and deduplicated against findings/. The organisation's bot files an issue or comments on an open one. We triage it, the bug is fixed in turflang with a pinned test in the same change, the finding's directory is committed and compiler.lock is bumped, and the next night treats it as known."
       height={340}
     >
       <Markers id={id} />
@@ -350,7 +350,7 @@ export function NightlyLoop() {
       <Edge id={id} d="M564 160 H594" />
       <Box x={596} y={120} w={108} h={80} title="the bot" sub="issue or comment" />
       <Edge id={id} d="M650 200 V258" />
-      <Box x={548} y={260} w={156} h={56} title="owner triage" sub="trace.py, reduce.py" />
+      <Box x={548} y={260} w={156} h={56} title="triage" sub="trace.py, reduce.py" />
       <Edge id={id} d="M548 288 H530" accent />
       <Box x={332} y={260} w={196} h={56} title="fix in turflang" sub="pinned test, same change" tone="hint" />
       <Edge id={id} d="M332 288 H306" accent />

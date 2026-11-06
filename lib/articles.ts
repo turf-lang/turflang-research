@@ -70,9 +70,9 @@ export type Article = {
 export const articles: Article[] = [
   {
     slug: "escape-analysis",
-    title: "References that can't outlive their frame: escape analysis in Turflang",
+    title: "How Turflang catches dangling references",
     summary:
-      "How the compiler stops a reference to a local from escaping its function without lifetime syntax, and the sixteen shapes a fuzzer found that it got wrong.",
+      "How the compiler stops a reference to a local from escaping its function without lifetime annotations, and sixteen cases a fuzzer found that it got wrong.",
     date: "2026-11-06",
     kind: "engineering",
     area: "compiler",
@@ -81,9 +81,9 @@ export const articles: Article[] = [
   },
   {
     slug: "turf-fuzzer",
-    title: "Inside the Turf Fuzzer: how Turflang finds its crashes first",
+    title: "How the Turf Fuzzer tests the Turflang compiler",
     summary:
-      "Every night, four jobs try to break the Turflang compiler. How turf-fuzz knows the right answer, names each bug once, cuts it to a dozen lines, and files it before anyone else hits it.",
+      "Every night, four jobs try to break the Turflang compiler. How turf-fuzz knows the right answer, groups repeat failures, shrinks each one to about a dozen lines, and files an issue.",
     date: "2026-11-05",
     kind: "engineering",
     area: "compiler",
